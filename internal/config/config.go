@@ -1,8 +1,3 @@
-// Package config loads and validates service configuration from the environment.
-//
-// Configuration is read once at startup by [Load]. A misconfigured process fails
-// immediately with every problem reported at once, rather than surfacing the
-// first issue and hiding the rest.
 package config
 
 import (
