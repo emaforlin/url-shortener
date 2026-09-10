@@ -1,5 +1,3 @@
-// Package logging builds the service logger and carries a request-scoped logger
-// through the context, so every log line from a request can be correlated.
 package logging
 
 import (
