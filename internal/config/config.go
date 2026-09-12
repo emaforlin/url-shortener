@@ -3,12 +3,15 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 // Environment names recognised by [Config.Validate].
@@ -16,6 +19,9 @@ const (
 	EnvDevelopment = "development"
 	EnvProduction  = "production"
 )
+
+// EnvFile is the dotenv file [Load] reads outside production.
+const EnvFile = ".env"
 
 // Config holds every tunable the service reads at startup.
 type Config struct {
@@ -40,7 +46,14 @@ func (c Config) IsProduction() bool { return c.Env == EnvProduction }
 // Load reads configuration from the environment, applies defaults for anything
 // unset, and validates the result. The returned Config is safe to use only when
 // the error is nil.
+//
+// Outside production it first folds [EnvFile] into the environment, so a
+// developer only needs a checked-out repository to start the service.
 func Load() (Config, error) {
+	if err := loadDotenv(EnvFile); err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
 		Env:      env("APP_ENV", EnvDevelopment),
 		Port:     env("APP_PORT", "8080"),
@@ -156,6 +169,52 @@ func (c Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// loadDotenv copies the assignments in path into the process environment.
+//
+// It is a development convenience and nothing more. In production every value
+// has to come from the orchestrator, so a dotenv file found there is reported
+// as a deployment mistake instead of being applied: a file baked into an image
+// silently outliving the deploy that produced it is exactly the kind of stale
+// configuration nobody notices until it is serving wrong short links.
+//
+// The production check reads APP_ENV from the process environment before the
+// file is parsed, on purpose. Deciding after the file had been folded in would
+// let the file exempt itself from the rule it is subject to.
+func loadDotenv(path string) error {
+	inProduction := os.Getenv("APP_ENV") == EnvProduction
+
+	if _, err := os.Stat(path); err != nil {
+		// No file is the normal case everywhere but a developer machine.
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("%s: %w", path, err)
+	}
+
+	if inProduction {
+		return fmt.Errorf(
+			"%s: dotenv files are not loaded when APP_ENV=%s, set the configuration in the process environment",
+			path, EnvProduction)
+	}
+
+	// Load, unlike Overload, leaves variables that are already set untouched, so
+	// anything exported in the shell or injected by the runtime still wins.
+	if err := godotenv.Load(path); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+
+	// The file must not be able to opt the process into production either: that
+	// would produce precisely what the check above refuses, a production
+	// configuration sourced from a file.
+	if os.Getenv("APP_ENV") == EnvProduction {
+		return fmt.Errorf(
+			"%s: must not set APP_ENV=%s, the deployment environment decides that",
+			path, EnvProduction)
+	}
+
+	return nil
 }
 
 func env(key, fallback string) string {
