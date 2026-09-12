@@ -38,10 +38,6 @@ func (l Link) IsExpired(now time.Time) bool {
 }
 
 // Store is the persistence contract for links.
-//
-// Every method takes a context as its first parameter so a network-backed
-// implementation can honour cancellation and deadlines without any signature
-// change here or in the callers.
 type Store interface {
 	// Create stores a new link, returning ErrAlreadyExists if the code is taken.
 	Create(ctx context.Context, l Link) error
