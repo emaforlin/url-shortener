@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/emaforlin/url-shortener/internal/links"
@@ -26,6 +27,10 @@ func respondDomainError(w http.ResponseWriter, r *http.Request, err error) {
 
 	case errors.Is(err, links.ErrInvalidURL):
 		respondError(w, r, http.StatusBadRequest, CodeBadRequest, "target URL is not a valid http(s) URL")
+
+	case errors.Is(err, links.ErrInvalidCode):
+		respondError(w, r, http.StatusBadRequest, CodeBadRequest, fmt.Sprintf(
+			"code must be %d-%d letters or digits", links.MinCodeLength, links.MaxCodeLength))
 
 	case errors.Is(err, links.ErrExpired):
 		respondError(w, r, http.StatusGone, CodeGone, "short link has expired")

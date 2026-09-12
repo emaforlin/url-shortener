@@ -71,9 +71,9 @@ type createLinkResponse struct {
 
 // CreateLink shortens a URL.
 //
-// The transport work — decoding, validation of the request shape, status mapping
-// — is complete. The domain call it delegates to is the stub, so this currently
-// answers 501; implementing [links.Service.Shorten] makes the endpoint live.
+// It checks the shape of the request only. Every rule about the URL and the code
+// belongs to [links.Service.Shorten], whose sentinel errors respondDomainError
+// turns into statuses.
 func (h *Handler) CreateLink(w http.ResponseWriter, r *http.Request) {
 	var req createLinkRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -91,6 +91,7 @@ func (h *Handler) CreateLink(w http.ResponseWriter, r *http.Request) {
 		CustomCode: req.Code,
 		TTL:        time.Duration(req.TTLSeconds) * time.Second,
 	})
+
 	if err != nil {
 		respondDomainError(w, r, err)
 		return
