@@ -1,0 +1,15 @@
+# Keep the build context to what the compiler actually needs: everything else
+# invalidates the Docker layer cache without changing the binary.
+.git
+.github
+.golangci.yml
+.env
+.env.example
+bin/
+docs/
+*.md
+Dockerfile
+.dockerignore
+Makefile
+*_test.go
+coverage.*
