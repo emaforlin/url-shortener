@@ -10,14 +10,14 @@ import (
 // Machine-readable error codes. Clients branch on these rather than on the
 // human-readable message, which is free to change.
 const (
-	CodeBadRequest     = "bad_request"
-	CodeNotFound       = "not_found"
-	CodeConflict       = "conflict"
-	CodeGone           = "gone"
+	CodeBadRequest      = "bad_request"
+	CodeNotFound        = "not_found"
+	CodeConflict        = "conflict"
+	CodeGone            = "gone"
 	CodePayloadTooLarge = "payload_too_large"
-	CodeTimeout        = "timeout"
-	CodeInternal       = "internal_error"
-	CodeNotImplemented = "not_implemented"
+	CodeTimeout         = "timeout"
+	CodeInternal        = "internal_error"
+	CodeNotImplemented  = "not_implemented"
 )
 
 // ErrorResponse is the single error envelope used by every failure path,
@@ -53,6 +53,7 @@ func respondJSON(w http.ResponseWriter, r *http.Request, status int, payload any
 	if r.Method == http.MethodHead {
 		return
 	}
+
 	if _, err := w.Write(body); err != nil {
 		// The status line is already sent, so this can only be logged.
 		logging.FromContext(r.Context()).WarnContext(r.Context(),
