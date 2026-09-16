@@ -19,15 +19,17 @@
 
 ## Decisions
 
-| Area             | Decision                                   | Main alternative, and why not                                                                                                        |
-| ---------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Compute          | AWS Lambda (Go, `provided.al2023`, arm64)  | ECS Fargate + ALB avoids cold starts, but the ALB alone costs more than $16/month.                                                   |
-| Entry point      | API Gateway HTTP API                       | A Lambda Function URL behind CloudFront is cheaper, but POSTs through it must carry a SHA-256 of the body.                           |
-| Data store       | DynamoDB, on-demand capacity               | RDS or Aurora Postgres: each cold start pays for a new connection, neither is free, and Aurora takes about 15 s to resume from zero. |
-| IaC              | Terraform, with state in S3                | —                                                                                                                                    |
-| CI access to AWS | GitHub OIDC with one IAM role per workflow | Long-lived access keys stored as secrets.                                                                                            |
-| Environments     | Production only                            | Staging plus production.                                                                                                             |
-| Release trigger  | Git tags matching `v*`                     | Deploying every merge to `main`. Worth revisiting once test coverage justifies it.                                                   |
+| Area             | Decision                                    | Main alternative, and why not                                                                                                        |
+| ---------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Compute          | AWS Lambda (Go, `provided.al2023`, arm64)   | ECS Fargate + ALB avoids cold starts, but the ALB alone costs more than $16/month.                                                   |
+| Entry point      | API Gateway HTTP API                        | A Lambda Function URL behind CloudFront is cheaper, but POSTs through it must carry a SHA-256 of the body.                           |
+| Data store       | DynamoDB, on-demand capacity                | RDS or Aurora Postgres: each cold start pays for a new connection, neither is free, and Aurora takes about 15 s to resume from zero. |
+| IaC              | Terraform, with state in S3                 | —                                                                                                                                    |
+| CI access to AWS | GitHub OIDC with one IAM role per workflow  | Long-lived access keys stored as secrets.                                                                                            |
+| Domain           | None for now: the default `execute-api` URL | A custom domain with an ACM certificate. Worth adding once the project has a domain to use.                                          |
+| Region           | `us-east-1`                                 | —                                                                                                                                    |
+| Environments     | Production only                             | Staging plus production.                                                                                                             |
+| Release trigger  | Git tags matching `v*`                      | Deploying every merge to `main`. Worth revisiting once test coverage justifies it.                                                   |
 
 ## System overview
 
@@ -36,12 +38,12 @@ flowchart LR
     client([Client])
 
     subgraph aws["AWS, single region"]
-        apigw["API Gateway HTTP API<br/>custom domain + ACM"]
+        apigw["API Gateway HTTP API<br/>execute-api URL"]
         fn["Lambda url-shortener<br/>alias: live"]
         ddb[("DynamoDB<br/>links")]
         logs["CloudWatch Logs<br/>and alarms"]
         sns["SNS<br/>email"]
-        state[("S3<br/>OpenTofu state")]
+        state[("S3<br/>Terraform state")]
         roles["IAM roles<br/>plan / infra / deploy"]
     end
 
@@ -58,7 +60,9 @@ flowchart LR
 
 **API Gateway (HTTP API)**
 
-- Serves a custom domain using an ACM certificate.
+- Served from its default `execute-api` URL, which is also `PUBLIC_BASE_URL`.
+  Terraform can pass that URL to the function without creating a dependency
+  cycle, because the API exists before its Lambda integration does.
 - A `$default` route sends every request to the function. Unknown paths therefore
   get the service's own JSON error envelope, not API Gateway's 404.
 - `POST /api/v1/links` is also declared as an explicit route. That lets it have
@@ -163,10 +167,10 @@ infra/
 
 ### Ownership
 
-| Owner                  | Manages                                                                                                                           |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| OpenTofu, `infra/main` | Every resource, IAM, the function's configuration (memory, timeout, environment variables), and the existence of the `live` alias |
-| `deploy.yml`           | The function's code, its published versions, and which version `live` points to                                                   |
+| Owner                   | Manages                                                                                                                           |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Terraform, `infra/main` | Every resource, IAM, the function's configuration (memory, timeout, environment variables), and the existence of the `live` alias |
+| `deploy.yml`            | The function's code, its published versions, and which version `live` points to                                                   |
 
 Enforcing that split takes the following rules:
 
@@ -175,7 +179,7 @@ Enforcing that split takes the following rules:
   apply could overwrite the deployed code.
 - **Alias target.** `aws_lambda_alias.live` sets
   `lifecycle { ignore_changes = [function_version] }`. Without this, every apply
-  rolls production back to the version OpenTofu last saw.
+  rolls production back to the version Terraform last saw.
 - **Configuration changes need a redeploy.** A published version freezes both code
   and configuration, so a new environment variable doesn't reach production until
   a new version is published. After an apply that changes the function's
@@ -221,7 +225,8 @@ Repository settings:
    `aws lambda wait function-updated`, and point `live` at the new version.
 3. **Smoke test.** `GET /healthz` must return a `version` equal to the tag. Once
    `DynamoStore` exists, also create a link and check that `GET /{code}` answers
-   `302`.
+   `302`. The job reads the API token from SSM with the `gh-deploy` role, so the
+   token isn't duplicated as a GitHub secret.
 4. **Rollback.** If the smoke test fails, point `live` back at the recorded version
    and fail the job. This takes seconds.
 5. **Release.** Publish a GitHub Release with the zip and its checksum.
@@ -247,16 +252,16 @@ sequenceDiagram
 No AWS credentials are stored in GitHub. Each workflow assumes its own role
 through OIDC, and each role's trust policy only accepts one token `sub`:
 
-| Role        | Allowed `sub`                                         | Permissions                                                                                             |
-| ----------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `gh-plan`   | `repo:emaforlin/url-shortener:pull_request`           | Read-only, plus the state lock object                                                                   |
-| `gh-infra`  | `repo:emaforlin/url-shortener:environment:infra`      | Manage the project's resources                                                                          |
-| `gh-deploy` | `repo:emaforlin/url-shortener:environment:production` | `UpdateFunctionCode`, `PublishVersion`, `GetAlias`, `UpdateAlias` and `GetFunction` on the one function |
+| Role        | Allowed `sub`                                         | Permissions                                                                                                                                                      |
+| ----------- | ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gh-plan`   | `repo:emaforlin/url-shortener:pull_request`           | Read-only, plus the state lock object                                                                                                                            |
+| `gh-infra`  | `repo:emaforlin/url-shortener:environment:infra`      | Manage the project's resources                                                                                                                                   |
+| `gh-deploy` | `repo:emaforlin/url-shortener:environment:production` | `UpdateFunctionCode`, `PublishVersion`, `GetAlias`, `UpdateAlias` and `GetFunction` on the one function; `ssm:GetParameter` on the API token, for the smoke test |
 
 ## Observability
 
 - **Logs.** The service writes JSON logs to stdout, which land in CloudWatch Logs.
-  The log group is declared in OpenTofu with 14-day retention. A group that Lambda
+  The log group is declared in Terraform with 14-day retention. A group that Lambda
   creates on its own never expires.
 - **API Gateway access logs** go to CloudWatch with the same retention.
 - **Alarms**, each notifying SNS by email: Lambda `Errors`, Lambda `Throttles`,
@@ -270,7 +275,8 @@ through OIDC, and each role's trust policy only accepts one token `sub`:
   `DeleteItem` and `DescribeTable` on the `links` table, read its SSM parameter,
   and write logs.
 - An open URL shortener gets abused for phishing quickly. Link creation therefore
-  requires a bearer token and has strict API Gateway throttling.
+  requires a bearer token and has strict API Gateway throttling. There is no
+  public demo: visitors can follow links, but only the maintainer creates them.
 - The service already refuses targets that aren't `http`/`https`, and targets that
   point back at its own host.
 
@@ -283,7 +289,6 @@ Estimated at 0–2 USD per month with portfolio-level traffic:
 | Lambda      | Covered by the always-free tier                            |
 | DynamoDB    | Cents; on-demand requests are billed per million           |
 | API Gateway | About 1 USD per million requests                           |
-| Route 53    | 0.50 USD per month per hosted zone, if DNS is hosted there |
 | CloudWatch  | Within the free tier, provided log retention stays bounded |
 | S3 (state)  | Cents                                                      |
 
@@ -311,6 +316,9 @@ Lambda uses neither probe. There, `/healthz` serves as the post-deploy smoke tes
 
 ## Implementation plan
 
+The functional specs in [`specs/`](specs/README.md) define when each step is
+done and how to verify it.
+
 - [ ] `cmd/lambda`, the shared wiring, and `make build-lambda`
 - [ ] `infra/bootstrap`, applied once by hand
 - [ ] `ci.yml`, plus branch protection on `main`
@@ -320,9 +328,5 @@ Lambda uses neither probe. There, `/healthz` serves as the post-deploy smoke tes
 
 ## Open questions
 
-- **Domain.** Which domain to use, and whether its DNS lives in Route 53. Until one
-  is chosen, `PUBLIC_BASE_URL` is the default `execute-api` URL. OpenTofu can pass
-  that URL to the function without creating a dependency cycle, because the API
-  exists before its Lambda integration does.
 - **Release trigger.** Whether to switch from tags to deploying every merge to
   `main`, once the tests are strong enough to be the only gate.
