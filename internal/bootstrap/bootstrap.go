@@ -34,8 +34,6 @@ func New(version string) (*App, error) {
 		"log_level", cfg.LogLevel.String(),
 	)
 
-	// Dependencies are constructed here and injected downward, so swapping the
-	// in-memory store for a database touches this wiring and nothing else.
 	store := links.NewMemoryStore()
 	service := links.NewService(store, cfg.BaseURL, logger)
 	handler := api.NewHandler(service, version)

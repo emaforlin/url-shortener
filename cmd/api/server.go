@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/emaforlin/url-shortener/internal/config"
+	"github.com/emaforlin/url-shortener/internal/bootstrap"
 )
 
 // runServer serves handler until ctx is canceled, then shuts down gracefully.
@@ -17,7 +17,11 @@ import (
 // shutdown: the listener closes, in-flight requests are given
 // cfg.ShutdownTimeout to finish, and only then are connections forced closed.
 // Without this, a deploy would sever every request in progress.
-func runServer(ctx context.Context, cfg config.Config, logger *slog.Logger, handler http.Handler) error {
+func runServer(ctx context.Context, app *bootstrap.App) error {
+	cfg := app.Config
+	logger := app.Logger
+	handler := app.Handler
+
 	srv := &http.Server{
 		Addr:    cfg.Addr(),
 		Handler: handler,
