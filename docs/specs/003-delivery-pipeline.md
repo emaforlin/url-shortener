@@ -55,7 +55,7 @@ GitHub Releases, and redeploys after configuration changes.
 | ID     | Requirement |
 | ------ | ----------- |
 | DEL-07 | **Build once.** A deploy of a tag without a Release MUST run the tests and then `make build-lambda VERSION=<tag>`. It uploads the zip and its SHA-256 as a workflow artifact. The deploy job verifies the checksum and deploys that exact file. |
-| DEL-08 | **Reuse released artifacts.** Redeploys and rollbacks of a tag that already has a Release MUST deploy that Release's `lambda.zip`, after checking it against `SHA256SUMS`. They never rebuild. This refines `architecture.md`, which rebuilds on every run. |
+| DEL-08 | **Reuse released artifacts.** Redeploys and rollbacks of a tag that already has a Release MUST deploy that Release's `lambda.zip`, after checking it against `SHA256SUMS`. They never rebuild. |
 
 ### Deploy and rollback
 

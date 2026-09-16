@@ -218,8 +218,11 @@ Repository settings:
 
 `deploy.yml` runs these steps:
 
-1. **Build.** Run the tests, then `make build-lambda VERSION=<tag>`, and upload the
-   zip as a workflow artifact. The deploy job reuses that exact file.
+1. **Build.** If the tag already has a GitHub Release, as in a redeploy or a
+   rollback, download its zip and verify it against `SHA256SUMS`. Nothing is
+   rebuilt. Otherwise, run the tests, then `make build-lambda VERSION=<tag>`, and
+   upload the zip and its checksum as a workflow artifact. Either way, the deploy
+   job deploys that exact file.
 2. **Deploy** (environment `production`). Record the version `live` currently
    points to. Upload the zip with `update-function-code --publish`, wait with
    `aws lambda wait function-updated`, and point `live` at the new version.
@@ -229,7 +232,8 @@ Repository settings:
    token isn't duplicated as a GitHub secret.
 4. **Rollback.** If the smoke test fails, point `live` back at the recorded version
    and fail the job. This takes seconds.
-5. **Release.** Publish a GitHub Release with the zip and its checksum.
+5. **Release.** On the first deploy of a tag, publish a GitHub Release with the zip
+   and its checksum. Redeploys and rollbacks leave the Release unchanged.
 
 ```mermaid
 sequenceDiagram
