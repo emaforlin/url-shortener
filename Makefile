@@ -5,6 +5,10 @@
 
 BINARY       := api
 CMD_PATH     := ./cmd/api
+LAMBDA_BINARY  := bootstrap
+LAMBDA_CMD_PATH := ./cmd/lambda
+LAMBDA_OUTPUT := ./dist
+LAMBDA_ZIP    := $(LAMBDA_OUTPUT)/lambda.zip
 BIN_DIR      := bin
 GO           ?= go
 
@@ -26,6 +30,17 @@ help: ## Show this help
 build: ## Compile the binary into bin/
 	@mkdir -p $(BIN_DIR)
 	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/$(BINARY) $(CMD_PATH)
+
+.PHONY: build-lambda
+build-lambda: ## Package the Lambda function as dist/lambda.zip (linux/arm64)
+	@mkdir -p $(LAMBDA_OUTPUT) $(BIN_DIR)
+	@rm -f $(LAMBDA_ZIP) $(BIN_DIR)/$(LAMBDA_BINARY)
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -tags lambda.norpc -o $(BIN_DIR)/$(LAMBDA_BINARY) $(LAMBDA_CMD_PATH)
+	zip -X -q -j $(LAMBDA_ZIP) $(BIN_DIR)/$(LAMBDA_BINARY)
+
+.PHONY: build-all
+build-all: build build-lambda ## Compile the binary for all targets
+	@echo "All binaries built."
 
 .PHONY: run
 run: ## Run the service from source
@@ -89,4 +104,4 @@ docker-run: ## Run the container image on port 8080
 
 .PHONY: clean
 clean: ## Remove build and coverage artifacts
-	rm -rf $(BIN_DIR) coverage.out coverage.html
+	rm -rf $(BIN_DIR) $(LAMBDA_OUTPUT) coverage.out coverage.html
