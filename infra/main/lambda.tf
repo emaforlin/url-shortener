@@ -79,8 +79,10 @@ resource "aws_lambda_function" "api" {
   function_name = local.function_name
   role          = aws_iam_role.api.arn
 
-  # Custom runtime: the zip holds a single `bootstrap` executable, so there is
-  # no handler to name.
+  # Custom runtime: the zip holds a single `bootstrap` executable. The runtime
+  # never reads `handler`, but the API rejects a Zip package without one, so it
+  # carries the executable's name.
+  handler       = "bootstrap"
   runtime       = "provided.al2023"
   architectures = ["arm64"]
   memory_size   = var.lambda_memory_size

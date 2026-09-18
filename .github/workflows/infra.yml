@@ -1,0 +1,322 @@
+name: Infra
+
+# Deliberately NOT `on: pull_request: paths: ['infra/**']`.
+#
+# If branch protection requires a check, and the workflow producing it never
+# triggers, GitHub waits forever for a status that will never arrive and the
+# pull request can never be merged. So this triggers on every pull request,
+# decides internally whether the expensive jobs run, and always reports the
+# `infra-ok` gate at the end (INF-28). ci.yml uses the same shape with `ci-ok`.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # On main, share a group name with deploy.yml so an apply and a deploy never
+  # touch the same function at once (DEL-16). Per-branch otherwise.
+  group: ${{ github.event_name == 'push' && 'aws-write' || format('infra-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: us-east-1
+  # Not a secret: it is already visible in the backend block of
+  # infra/main/terraform.tf, and knowing it grants nothing on its own.
+  AWS_ACCOUNT_ID: "637423436643"
+  TF_VERSION: "1.10.5"
+  WORKING_DIR: infra/main
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      infra: ${{ steps.filter.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            infra:
+              - 'infra/**'
+              - '.github/workflows/infra.yml'
+              - '.tflint.hcl'
+
+  validate:
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No AWS access at all: everything here is static analysis, and a job that
+    # cannot reach the account cannot damage it.
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive infra/
+
+      - name: terraform validate (bootstrap)
+        run: |
+          terraform -chdir=infra/bootstrap init -backend=false -input=false
+          terraform -chdir=infra/bootstrap validate
+
+      - name: terraform validate (main)
+        run: |
+          terraform -chdir=infra/main init -backend=false -input=false
+          terraform -chdir=infra/main validate
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: tflint
+        run: |
+          tflint --init
+          tflint --chdir=infra/bootstrap --format=compact
+          tflint --chdir=infra/main --format=compact
+
+      # HIGH and CRITICAL fail the check. A finding that is wrong for this
+      # project is silenced with an inline `#trivy:ignore:<ID>` comment next to
+      # the resource, with the justification on the adjacent line — that keeps
+      # the reasoning where a reviewer will see it (INF-25).
+      - name: trivy config
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: infra/
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          trivy-config: ""
+
+  plan:
+    needs: [changes, validate]
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.changes.outputs.infra == 'true' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # mint the OIDC token
+      pull-requests: write # post the plan comment
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/gh-plan
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: terraform -chdir="$WORKING_DIR" init -input=false
+
+      # Locking stays on. gh-plan is allowed exactly one write — the .tflock
+      # object beside the state file — so a plan and an apply cannot interleave.
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform -chdir="$WORKING_DIR" plan -no-color -input=false -out=tfplan
+          echo "exitcode=$?" >> "$GITHUB_OUTPUT"
+          terraform -chdir="$WORKING_DIR" show -no-color tfplan > plan.txt
+        env:
+          TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
+
+      - name: Post plan as a pull request comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- infra-plan -->';
+
+            // GitHub rejects comments over 65536 characters, and a plan that
+            // touches many resources gets there easily. Truncate rather than
+            // fail: the full output is in the job log.
+            const limit = 60000;
+            let plan = fs.readFileSync('plan.txt', 'utf8');
+            let truncated = '';
+            if (plan.length > limit) {
+              plan = plan.slice(0, limit);
+              truncated = '\n\n> Output truncated. See the full plan in the job log.';
+            }
+
+            const failed = '${{ steps.plan.outputs.exitcode }}' !== '0';
+            const heading = failed
+              ? '### Terraform plan failed'
+              : '### Terraform plan';
+
+            const body = [
+              marker,
+              heading,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '',
+              '</details>',
+              truncated,
+            ].join('\n');
+
+            // One comment per pull request, edited on every push, so the thread
+            // is not buried under a wall of stale plans (INF-25).
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body.startsWith(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                ...context.repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: context.issue.number, body,
+              });
+            }
+
+      - name: Fail if the plan failed
+        if: steps.plan.outputs.exitcode != '0'
+        run: exit 1
+
+  # A pull request from a fork gets no OIDC token: GitHub withholds it by
+  # design, because a fork's code must not be able to reach the base
+  # repository's cloud account. Without this job the plan job would fail with a
+  # confusing AWS credentials error instead of explaining itself (INF-26).
+  plan-skipped:
+    needs: changes
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.changes.outputs.infra == 'true' &&
+      github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Explain why no plan ran
+        run: |
+          {
+            echo "### Terraform plan skipped"
+            echo
+            echo "This pull request comes from a fork, and GitHub does not issue an"
+            echo "OIDC token to fork workflows. A maintainer has to run the plan from"
+            echo "a branch in this repository before merging."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    needs: [changes, validate]
+    if: github.event_name == 'push' && needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Restricted to the main branch in the repository settings, which is what
+    # makes the `:environment:infra` OIDC subject meaningful (INF-27).
+    environment: infra
+    permissions:
+      contents: read
+      id-token: write
+      actions: write # dispatch deploy.yml for the redeploy below
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/gh-infra
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: terraform -chdir="$WORKING_DIR" init -input=false
+
+      # Plan to a file, then apply that exact file. Applying a saved plan means
+      # what is applied is what was inspected — and it lets the next step read
+      # the intended changes as JSON.
+      - name: terraform plan
+        run: terraform -chdir="$WORKING_DIR" plan -no-color -input=false -out=tfplan
+        env:
+          TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
+
+      - name: Detect function configuration changes
+        id: detect
+        run: |
+          changed=$(terraform -chdir="$WORKING_DIR" show -json tfplan \
+            | jq -r '[.resource_changes[]
+                      | select(.address == "aws_lambda_function.api")
+                      | select(.change.actions | index("update") or index("create"))]
+                     | length > 0')
+          echo "function_config_changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "Function configuration changed: $changed"
+
+      - name: terraform apply
+        run: terraform -chdir="$WORKING_DIR" apply -no-color -input=false tfplan
+
+      # A published version freezes code *and* configuration together, so a new
+      # environment variable does not reach production just because Terraform
+      # updated $LATEST. Production keeps serving the version `live` points at
+      # until a new one is published, which is deploy.yml's job (INF-29).
+      #
+      # The live tag is the description of the version `live` currently points
+      # to — deploy.yml stamps the git tag there when it publishes.
+      - name: Redeploy the live tag
+        if: steps.detect.outputs.function_config_changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f .github/workflows/deploy.yml ]; then
+            echo "::warning::Function configuration changed, but deploy.yml does not exist yet (spec 003)." \
+                 "The new configuration will reach production with the next deploy."
+            exit 0
+          fi
+
+          function_name=$(terraform -chdir="$WORKING_DIR" output -raw function_name)
+          version=$(aws lambda get-alias \
+            --function-name "$function_name" --name live \
+            --query FunctionVersion --output text)
+          tag=$(aws lambda get-function \
+            --function-name "$function_name" --qualifier "$version" \
+            --query Configuration.Description --output text)
+
+          if [ -z "$tag" ] || [ "$tag" = "None" ]; then
+            echo "::warning::Version $version has no tag in its description; cannot redeploy automatically."
+            exit 0
+          fi
+
+          echo "Requesting a redeploy of $tag to pick up the new configuration."
+          gh workflow run deploy.yml -f tag="$tag"
+
+  # The required check. It reports on every pull request, including ones that
+  # never ran a plan, so a change touching only cmd/ is not blocked forever by a
+  # status that never arrives (INF-28).
+  infra-ok:
+    if: always()
+    needs: [changes, validate, plan, plan-skipped, apply]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any infra job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - name: Report
+        run: echo "Infra checks complete (skipped jobs count as success)."
