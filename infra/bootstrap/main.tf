@@ -22,6 +22,12 @@ resource "aws_s3_bucket_versioning" "state" {
   }
 }
 
+# SSE-S3 rather than SSE-KMS with a customer-managed key. 
+# A CMK puts a key policy between the CI roles and the state file — 
+# a new way for every apply to fail.
+# The bucket is private, TLS-only and versioned, and the state holds resource
+# attributes rather than secrets.
+# trivy:ignore:AVD-AWS-0132
 resource "aws_s3_bucket_server_side_encryption_configuration" "state" {
   bucket = aws_s3_bucket.state.id
 
