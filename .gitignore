@@ -34,3 +34,15 @@ go.work.sum
 # Build output
 bin/
 dist/
+
+# Terraform. State can hold resource attributes that are not meant to be public,
+# and .terraform/ is a per-machine cache of providers and backend configuration.
+# .terraform.lock.hcl is deliberately NOT ignored: it pins provider checksums, so
+# CI and a developer machine resolve the same provider binaries.
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
