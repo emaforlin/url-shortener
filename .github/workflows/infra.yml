@@ -99,7 +99,6 @@ jobs:
           trivy-config: ""
 
   plan:
-    environment: infra
     needs: [changes, validate]
     if: >-
       github.event_name == 'pull_request' &&
