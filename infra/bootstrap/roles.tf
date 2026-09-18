@@ -225,6 +225,33 @@ data "aws_iam_policy_document" "infra" {
     ]
   }
 
+  # API Gateway does not write access logs itself: it asks CloudWatch Logs to set
+  # up a *log delivery*, and the caller needs rights over that delivery. None of
+  # these actions support resource-level permissions — IAM only ever matches them
+  # against "*" — so the `logs:*` grant above, scoped to log-group ARNs, does not
+  # cover them and the stage fails to create with "Insufficient permissions to
+  # enable logging".
+  #
+  # PutResourcePolicy is the widest of them: it is how CloudWatch Logs is granted
+  # write access to the destination group, and on "*" it reaches every log
+  # resource policy in the account. It is needed only where the delivery is set
+  # up for the first time, but an apply that finds the policy missing fails
+  # without it.
+  statement {
+    sid    = "VendedLogDelivery"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogDelivery",
+      "logs:GetLogDelivery",
+      "logs:UpdateLogDelivery",
+      "logs:DeleteLogDelivery",
+      "logs:ListLogDeliveries",
+      "logs:PutResourcePolicy",
+      "logs:DescribeResourcePolicies",
+    ]
+    resources = ["*"]
+  }
+
   # DescribeLogGroups and DescribeAlarms have no resource-level permissions: they
   # are list operations and only accept "*".
   statement {
