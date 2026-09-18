@@ -90,7 +90,7 @@ jobs:
       # the resource, with the justification on the adjacent line — that keeps
       # the reasoning where a reviewer will see it (INF-25).
       - name: trivy config
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: lazy-actions/gitrivy@v3
         with:
           scan-type: config
           scan-ref: infra/
