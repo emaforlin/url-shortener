@@ -6,25 +6,29 @@ locals {
 
   # One role per workflow, each trusting exactly one GitHub OIDC subject.
   #
-  # The `sub` claim describes what produced the token. `:pull_request` is minted
-  # for pull request runs; `:environment:<name>` only for a job that declares
-  # `environment: <name>`, which GitHub gates on its own branch/tag rules. So the
-  # deploy role can only be reached from a job running in the `production`
-  # environment, which the repository settings restrict to `v*` tags.
+  # The `sub` claim describes what produced the token: a repository prefix, then
+  # the context. `:pull_request` is minted for pull request runs;
+  # `:environment:<name>` only for a job that declares `environment: <name>`,
+  # which GitHub gates on its own branch/tag rules. So the deploy role can only
+  # be reached from a job running in the `production` environment, which the
+  # repository settings restrict to `v*` tags.
+  #
+  # The prefix is not `repo:owner/name` — see var.github_subject_prefix. The
+  # context segments below are unaffected by that format change.
   ci_roles = {
     plan = {
       name        = "gh-plan"
-      sub         = "repo:${var.github_repository}:pull_request"
+      sub         = "${var.github_subject_prefix}:pull_request"
       description = "Terraform plan on pull requests. Read-only, plus the state lock object."
     }
     infra = {
       name        = "gh-infra"
-      sub         = "repo:${var.github_repository}:environment:${var.infra_environment}"
+      sub         = "${var.github_subject_prefix}:environment:${var.infra_environment}"
       description = "Terraform apply of infra/main. Cannot touch the bootstrap stack."
     }
     deploy = {
       name        = "gh-deploy"
-      sub         = "repo:${var.github_repository}:environment:${var.production_environment}"
+      sub         = "${var.github_subject_prefix}:environment:${var.production_environment}"
       description = "Function code deploys and rollbacks. Cannot change infrastructure."
     }
   }

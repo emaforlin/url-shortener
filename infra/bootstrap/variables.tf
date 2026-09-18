@@ -16,14 +16,29 @@ variable "noncurrent_version_retention_days" {
   default     = 90
 }
 
-variable "github_repository" {
-  description = "GitHub repository allowed to assume the CI roles, as owner/name."
+variable "github_subject_prefix" {
+  description = <<-EOT
+    The repository part of the OIDC `sub` claim, which the CI role trust
+    policies match exactly.
+
+    Repositories created after 2026-07-15 use GitHub's *immutable* subject
+    format, which carries the numeric owner and repository IDs alongside their
+    names: `repo:owner@<owner-id>/name@<repo-id>`. The IDs are what make it
+    immutable — renaming the owner or the repository changes the names in the
+    claim but not the IDs, and a trust policy pinned to the old plain
+    `repo:owner/name` form stops matching the moment the feature is on.
+
+    Read the current value straight from GitHub rather than assembling it:
+
+        gh api repos/<owner>/<name>/actions/oidc/customization/sub \
+          --jq .sub_claim_prefix
+  EOT
   type        = string
-  default     = "emaforlin/url-shortener"
+  default     = "repo:emaforlin@32603957/url-shortener@1364122573"
 
   validation {
-    condition     = can(regex("^[^/]+/[^/]+$", var.github_repository))
-    error_message = "github_repository must be owner/name, with no leading or trailing slash."
+    condition     = can(regex("^repo:[^/:]+@[0-9]+/[^/:]+@[0-9]+$", var.github_subject_prefix))
+    error_message = "github_subject_prefix must look like repo:owner@123/name@456, with no trailing context segment."
   }
 }
 
