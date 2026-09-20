@@ -1,0 +1,586 @@
+name: Deploy
+
+# Deploys one tag to production, smoke tests it, and rolls back on its own when
+# that check fails. The tag is always `github.ref_name` — there is no
+# tag input — so a tag push and a `workflow_dispatch` with "Use workflow from"
+# set to a tag take exactly the same path, and a dispatch runs the workflow
+# definition as it was at that tag.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      config_redeploy:
+        description: "This run follows an infra apply: skip if a different tag is live."
+        type: boolean
+        required: false
+        default: false
+      force_smoke_failure:
+        description: "Fail the smoke test on purpose, to exercise the rollback."
+        type: boolean
+        required: false
+        default: false
+
+# Shared with infra.yml's apply on main, so a deploy and an apply never touch the
+# same function at once. A newer run waits; it never cancels a running one.
+concurrency:
+  group: aws-write
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  # Not a secret: it is already visible in the backend block of
+  # infra/main/terraform.tf, and knowing it grants nothing on its own.
+  AWS_ACCOUNT_ID: "637423436643"
+  # `${var.project}-api` in infra/main/lambda.tf. Spelled out rather than read
+  # from a Terraform output, because gh-deploy has no access to the state — that
+  # is the point of the role split.
+  FUNCTION_NAME: url-shortener-api
+  ALIAS_NAME: live
+
+jobs:
+  # Everything that can reject a run before it costs anything.
+  # A run that fails here has changed nothing anywhere.
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      has_release: ${{ steps.release.outputs.has_release }}
+    steps:
+      # The ref goes through `env:` rather than into the script body: a `${{ }}`
+      # interpolated straight into a shell command is pasted in as text before
+      # the shell ever sees it, which is how a crafted ref name becomes command
+      # injection.
+      - name: Resolve the tag
+        id: tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::error::This workflow deploys a tag, and this run is on the ${REF_TYPE} '${REF_NAME}'." \
+                 "Re-run it with 'Use workflow from' set to the tag you want deployed."
+            exit 1
+          fi
+
+          # A `v*` push trigger is as narrow as GitHub's ref filters get, so
+          # `vtest` starts a run. It dies here, before anything is built.
+          if ! printf '%s' "$REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Tag '${REF_NAME}' is not a release version." \
+                 "A deployable tag looks like v1.4.2: vMAJOR.MINOR.PATCH, no suffix."
+            exit 1
+          fi
+
+          echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+
+      # fetch-depth: 0 is what puts `origin/main` on the runner. The default
+      # shallow fetch retrieves the tagged commit alone, and the check below
+      # would have no branch to compare it against.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # A tag can be pushed onto any commit in the repository, including one that
+      # only ever existed on a branch and never passed review. Production only
+      # runs code that went through `main`.
+      - name: Check the commit is reachable from main
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag ${TAG} points at ${GITHUB_SHA}, which is not reachable from main." \
+                 "Merge the commit first, then tag the merged commit."
+            exit 1
+          fi
+
+          echo "${TAG} → ${GITHUB_SHA} is on main."
+
+      # The Release is what makes a tag's artifact immutable: it is built once,
+      # on the tag push, and every later redeploy or rollback ships that same
+      # zip. So its presence decides what the next job does — and, on a
+      # tag push, its presence is an error.
+      - name: Look for an existing Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # Not a bare `if gh release view`: that treats every failure as "no
+          # Release", so an auth or network blip would quietly turn a redeploy
+          # into a rebuild and ship a zip nobody released. Only the API's own
+          # "not found" counts as absent.
+          if out=$(gh release view "$TAG" --json tagName 2>&1); then
+            has_release=true
+          elif printf '%s' "$out" | grep -qi 'release not found'; then
+            has_release=false
+          else
+            echo "::error::Could not determine whether Release ${TAG} exists: ${out}"
+            exit 1
+          fi
+
+          echo "has_release=$has_release" >> "$GITHUB_OUTPUT"
+
+          # A tag push is the *first* deploy of a tag by definition. If a Release
+          # is already there, the tag was deleted and re-pushed onto different
+          # code, and the released artifact no longer matches the tag that names
+          # it. Redeploys and rollbacks arrive by dispatch and are unaffected.
+          if [ "$has_release" = "true" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            echo "::error::Release ${TAG} already exists, so this tag has been deployed before." \
+                 "Tags are immutable: cut a new version instead of re-pushing this one."
+            exit 1
+          fi
+
+      - name: Summary
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          HAS_RELEASE: ${{ steps.release.outputs.has_release }}
+        run: |
+          set -euo pipefail
+
+          if [ "$HAS_RELEASE" = "true" ]; then
+            source="the artifact published with Release ${TAG}"
+          else
+            source="a fresh build of ${TAG}"
+          fi
+
+          {
+            echo "### Deploying ${TAG}"
+            echo
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Artifact: ${source}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Two ways in, one way out. Whether the zip is built here or pulled from the
+  # Release that already carries it, this job ends with the same two files under
+  # dist/ and uploads them under one artifact name — so the deploy job has a
+  # single download to do and never has to know which path ran.
+  artifact:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      HAS_RELEASE: ${{ needs.resolve.outputs.has_release }}
+    steps:
+      # --- Build path: a tag with no Release yet ---------------------------
+      #
+      # This is the only place a deployable zip is ever produced. Every later
+      # redeploy and every rollback of this tag reuses the file built here.
+
+      - uses: actions/checkout@v5
+        if: needs.resolve.outputs.has_release == 'false'
+
+      - uses: actions/setup-go@v6
+        if: needs.resolve.outputs.has_release == 'false'
+        with:
+          go-version-file: go.mod
+
+      # ci.yml already ran these on the commit when it merged, but a tag is a
+      # separate decision to ship, and this is the run that produces the
+      # artifact. Nothing is built from code whose tests have not just passed.
+      - name: Run the tests
+        if: needs.resolve.outputs.has_release == 'false'
+        run: go test -race ./...
+
+      - name: Build the artifact
+        if: needs.resolve.outputs.has_release == 'false'
+        run: |
+          set -euo pipefail
+
+          # VERSION is what -ldflags stamps into main.version, which is what
+          # /healthz reports back. The smoke test compares that value against
+          # the tag, so an unstamped build fails the deploy it belongs to.
+          make build-lambda VERSION="$TAG"
+
+          # Bare filename, not dist/lambda.zip. `sha256sum -c` resolves the path
+          # recorded inside the file relative to the current directory, and this
+          # file is published as a Release asset that gets verified years later
+          # in a directory that has no dist/ in it.
+          cd dist
+          sha256sum lambda.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      # --- Reuse path: a tag that already has a Release ---------------------
+      #
+      # A redeploy or a rollback ships the bytes that were released under this
+      # tag, never a rebuild of them. Rebuilding would mean the tag's meaning
+      # depends on when it was built — a moved dependency or a newer toolchain
+      # is enough to make it a different binary.
+
+      - name: Download the released artifact
+        if: needs.resolve.outputs.has_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This path never checks the repository out, so gh has no git remote
+          # to infer the repository from and needs it stated.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          gh release download "$TAG" --dir dist --pattern lambda.zip --pattern SHA256SUMS
+
+      # --- Both paths converge here ----------------------------------------
+
+      # On the reuse path this is the integrity check the spec asks for: the
+      # asset is only as trustworthy as the checksum published beside it. On the
+      # build path it is nearly free, and it proves the pair being uploaded is
+      # self-consistent rather than assuming it.
+      - name: Verify the checksum
+        run: |
+          set -euo pipefail
+
+          cd dist
+          sha256sum -c SHA256SUMS
+
+      - name: Record the artifact identity
+        run: |
+          set -euo pipefail
+
+          # Lambda reports a published version's code as CodeSha256, which is the
+          # base64 of the zip's SHA-256 rather than the hex digest everything
+          # else prints. Recording both here is what turns "does the deployed
+          # version match the Release?" into a comparison instead of a
+          # conversion someone has to do by hand.
+          hex=$(cut -d' ' -f1 dist/SHA256SUMS)
+          code_sha256=$(openssl dgst -binary -sha256 dist/lambda.zip | base64)
+
+          if [ "$HAS_RELEASE" = "true" ]; then
+            origin="downloaded from Release ${TAG}"
+          else
+            origin="built from ${GITHUB_SHA}"
+          fi
+
+          {
+            echo "### Artifact"
+            echo
+            echo "- Source: ${origin}"
+            echo "- SHA-256: \`${hex}\`"
+            echo "- CodeSha256: \`${code_sha256}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lambda-${{ needs.resolve.outputs.tag }}
+          path: |
+            dist/lambda.zip
+            dist/SHA256SUMS
+          # Both files, or the deploy job fails later and less clearly.
+          if-no-files-found: error
+          # Only needed for the length of this run: on the build path the zip
+          # goes on to the Release, and on the reuse path it came from one.
+          retention-days: 7
+  
+  deploy:
+    needs: [resolve, artifact]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The GitHub environment is half of the security model: gh-deploy's trust
+    # policy accepts only the OIDC subject `...:environment:production`, and the
+    # environment's own rules restrict which refs may reach it.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      # Before the artifact download, not after: checkout clears untracked files
+      # from the workspace, and a downloaded dist/ is exactly that.
+      #
+      # Sparse, because this job wants one script and not the source tree. It
+      # comes from the tag being deployed, like the workflow definition itself,
+      # so a redeploy runs the poll logic that shipped with that tag.
+      - name: Fetch the deploy scripts
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+
+      # `path` is the destination *directory*, not a list of files. The artifact
+      # already holds lambda.zip and SHA256SUMS at its root, so this puts them
+      # back under dist/ exactly as the artifact job laid them out.
+      - name: Download the artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: lambda-${{ needs.resolve.outputs.tag }}
+          path: dist
+
+      # v8 checks its own transfer digest, which catches a corrupted download.
+      # This is the different claim the spec actually asks for: that these bytes
+      # are the ones published under this tag.
+      - name: Verify the checksum
+        run: |
+          set -euo pipefail
+
+          cd dist
+          sha256sum -c SHA256SUMS
+
+      # Credentials, once. They persist for the rest of the job, so the AWS
+      # calls below are ordinary shell steps.
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/gh-deploy
+
+      # Read N-1 before anything moves. Every rollback path below depends on
+      # this being recorded while production is still known-good.
+      - name: Record what live points at
+        id: previous
+        run: |
+          set -euo pipefail
+
+          prev_version=$(aws lambda get-alias \
+            --function-name "$FUNCTION_NAME" --name "$ALIAS_NAME" \
+            --query FunctionVersion --output text)
+
+          # Each published version's description is the tag that shipped it.
+          # That is the only record of what is live: nothing else in the account
+          # maps a running version back to a git tag.
+          prev_tag=$(aws lambda get-function \
+            --function-name "$FUNCTION_NAME" --qualifier "$prev_version" \
+            --query Configuration.Description --output text)
+
+          # Terraform creates the function from a placeholder zip and never sets
+          # a description, so the first deploy of all finds "None" here. A
+          # description that is not a release tag means there is no previous
+          # release: rollback still targets this version, but the summary must
+          # not name a tag that was never deployed.
+          if printf '%s' "$prev_tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            prev_is_release=true
+          else
+            prev_is_release=false
+            prev_tag=""
+          fi
+
+          {
+            echo "prev_version=$prev_version"
+            echo "prev_tag=$prev_tag"
+            echo "prev_is_release=$prev_is_release"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "live is version ${prev_version} (${prev_tag:-no previous release})"
+
+      # A configuration redeploy carries the tag that was live when the apply
+      # finished. If a different tag went live in between, that deploy ran after
+      # the apply — it already published a version with the new configuration,
+      # and redeploying an older tag here would roll production backwards.
+      #
+      # The answer is to do nothing and succeed, which means gating the steps
+      # below: `exit 0` would only end this step, and the deploy would proceed.
+      - name: Decide whether this run still applies
+        id: gate
+        env:
+          # `inputs` is empty on a tag push, so this is "" there rather than
+          # "false". Comparing strings in the shell sidesteps the trap that a
+          # `type: boolean` input is a real boolean in `${{ }}` expressions and
+          # never equal to the string 'true'.
+          CONFIG_REDEPLOY: ${{ inputs.config_redeploy }}
+          PREV_TAG: ${{ steps.previous.outputs.prev_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ "$CONFIG_REDEPLOY" = "true" ] && [ "$PREV_TAG" != "$TAG" ]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Skipped"
+              echo
+              echo "This run was queued by an infra apply to redeploy \`${TAG}\`," \
+                   "but \`${PREV_TAG:-the placeholder}\` is live now. That deploy ran" \
+                   "after the apply, so it already carries the new configuration."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "deploy=true" >> "$GITHUB_OUTPUT"
+
+      # Four calls where one looks like it would do.
+      #
+      # `update-function-code --publish` publishes a version with no
+      # description, and the description is where the live tag lives —
+      # infra.yml reads it back to know what to redeploy after a configuration
+      # change. update-function-code has no --description, so the publish has to
+      # be its own call.
+      - name: Publish the version
+        id: publish
+        if: steps.gate.outputs.deploy == 'true'
+        run: |
+          set -euo pipefail
+
+          aws lambda update-function-code \
+            --function-name "$FUNCTION_NAME" \
+            --zip-file fileb://dist/lambda.zip > /dev/null
+
+          # The upload returns while the function is still updating. Publishing
+          # from a function in that state fails.
+          aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+
+          # --code-sha256 makes the publish fail closed: if $LATEST is not the
+          # artifact verified above, this errors instead of shipping whatever
+          # else got there. Lambda expects the base64 of the SHA-256, not hex.
+          code_sha256=$(openssl dgst -binary -sha256 dist/lambda.zip | base64)
+
+          # Nothing changed since the last publish — a redeploy of the live tag
+          # with no new code — and Lambda returns the existing version instead
+          # of making a duplicate. That is what lets a no-op redeploy succeed
+          # with live sitting on the same version.
+          new_version=$(aws lambda publish-version \
+            --function-name "$FUNCTION_NAME" \
+            --description "$TAG" \
+            --code-sha256 "$code_sha256" \
+            --query Version --output text)
+
+          aws lambda wait published-version-active \
+            --function-name "$FUNCTION_NAME" --qualifier "$new_version"
+
+          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+          echo "published version ${new_version} as ${TAG}"
+
+      - name: Point live at the new version
+        id: switch
+        if: steps.gate.outputs.deploy == 'true'
+        env:
+          NEW_VERSION: ${{ steps.publish.outputs.new_version }}
+        run: |
+          set -euo pipefail
+
+          aws lambda update-alias \
+            --function-name "$FUNCTION_NAME" \
+            --name "$ALIAS_NAME" \
+            --function-version "$NEW_VERSION" > /dev/null
+
+          # Production is serving the new version from here on, so every later
+          # failure — including a cancellation — has to move the alias back.
+          echo "alias_moved=true" >> "$GITHUB_OUTPUT"
+          echo "live → version ${NEW_VERSION} (${TAG})"
+
+      # The check that decides whether this deploy stands. It runs against the
+      # public URL, through API Gateway, because that is what a user reaches —
+      # invoking the function directly would skip the one component most likely
+      # to be misconfigured.
+      - name: Smoke test
+        id: smoke
+        if: steps.gate.outputs.deploy == 'true'
+        env:
+          NEW_VERSION: ${{ steps.publish.outputs.new_version }}
+          FORCE_FAILURE: ${{ inputs.force_smoke_failure }}
+        run: |
+          set -euo pipefail
+
+          # The origin comes from the function's own configuration rather than a
+          # repository variable: it is the value the service builds short links
+          # against, so by construction it cannot drift from what is deployed.
+          # gh-deploy can read it because it already needs GetFunction.
+          base_url=$(aws lambda get-function \
+            --function-name "$FUNCTION_NAME" --qualifier "$NEW_VERSION" \
+            --query 'Configuration.Environment.Variables.PUBLIC_BASE_URL' \
+            --output text)
+
+          if [ -z "$base_url" ] || [ "$base_url" = "None" ]; then
+            echo "::error::Version ${NEW_VERSION} has no PUBLIC_BASE_URL in its environment," \
+                 "so there is no public origin to smoke test. Check infra/main/api.tf."
+            exit 1
+          fi
+
+          expected="$TAG"
+          if [ "$FORCE_FAILURE" = "true" ]; then
+            # Not an early exit: the point is to exercise the real failure path,
+            # so this waits out the full timeout exactly as a genuinely broken
+            # deploy would before the rollback takes over.
+            expected="forced-smoke-failure"
+            echo "::warning::force_smoke_failure is set. Expecting version" \
+                 "'${expected}', which can never match, to exercise the rollback."
+          fi
+
+          if ! bash .github/scripts/poll-healthz.sh "$base_url" "$expected"; then
+            echo "::error::Smoke test failed: ${base_url}/healthz never settled on" \
+                 "version ${expected}. Rolling back."
+            exit 1
+          fi
+
+      # DEL-11. This runs when the smoke test failed, when anything after the
+      # alias move failed, and when the run was cancelled — GitHub still runs a
+      # `cancelled()` step, within a grace period.
+      #
+      # The guard is `alias_moved`, not the deploy gate: if the alias never
+      # moved, production is untouched and there is nothing to undo. A rollback
+      # that fires anyway would move `live` for no reason.
+      - name: Roll back to the previous version
+        id: rollback
+        if: ${{ (failure() || cancelled()) && steps.switch.outputs.alias_moved == 'true' }}
+        env:
+          PREV_VERSION: ${{ steps.previous.outputs.prev_version }}
+          PREV_TAG: ${{ steps.previous.outputs.prev_tag }}
+          PREV_IS_RELEASE: ${{ steps.previous.outputs.prev_is_release }}
+        run: |
+          set -euo pipefail
+
+          echo "::warning::${TAG} failed after live moved. Returning live to version" \
+               "${PREV_VERSION} (${PREV_TAG:-the placeholder})."
+
+          aws lambda update-alias \
+            --function-name "$FUNCTION_NAME" \
+            --name "$ALIAS_NAME" \
+            --function-version "$PREV_VERSION" > /dev/null
+
+          # DEL-13: the placeholder is a stub that exits non-zero on every
+          # invocation, so there is no healthy state to wait for and polling
+          # would burn the timeout to learn nothing. The alias is back where it
+          # started, which is the whole of what can be verified here.
+          if [ "$PREV_IS_RELEASE" != "true" ]; then
+            echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+            echo "live is back on the placeholder version ${PREV_VERSION}." \
+                 "There was no previous release to health check."
+            exit 0
+          fi
+
+          base_url=$(aws lambda get-function \
+            --function-name "$FUNCTION_NAME" --qualifier "$PREV_VERSION" \
+            --query 'Configuration.Environment.Variables.PUBLIC_BASE_URL' \
+            --output text)
+
+          # The same wait as the smoke test, asked about the old tag instead.
+          if bash .github/scripts/poll-healthz.sh "$base_url" "$PREV_TAG"; then
+            echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+            echo "Rolled back: ${PREV_TAG} (version ${PREV_VERSION}) is serving again."
+          else
+            echo "rolled_back=false" >> "$GITHUB_OUTPUT"
+            echo "::error::live was pointed back at version ${PREV_VERSION} (${PREV_TAG})," \
+                 "but /healthz never confirmed it. Production state is unknown."
+            exit 1
+          fi
+  
+  summary:
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Summary
+        run: |
+          set -euo pipefail
+
+          echo "### Deploy summary" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ needs.deploy.outputs.deploy }}" != "true" ]; then
+            echo "- This run was skipped because a different tag is live now." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${{ needs.deploy.outputs.rolled_back }}" = "true" ]; then
+            echo "- Rolled back to the previous version." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ needs.deploy.outputs.rolled_back }}" = "false" ]; then
+            echo "- Rollback failed: production state is unknown." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Deployed successfully and passed the smoke test." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      
