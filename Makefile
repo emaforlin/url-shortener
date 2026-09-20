@@ -38,8 +38,12 @@ build-lambda: ## Package the Lambda function as dist/lambda.zip (linux/arm64)
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -tags lambda.norpc -o $(BIN_DIR)/$(LAMBDA_BINARY) $(LAMBDA_CMD_PATH)
 	zip -X -q -j $(LAMBDA_ZIP) $(BIN_DIR)/$(LAMBDA_BINARY)
 
+.PHONY: build-docker
+build-docker: ## Build the container image
+	docker build --build-arg VERSION=$(VERSION) -t $(DOCKER_IMAGE):$(VERSION) -t $(DOCKER_IMAGE):latest .
+
 .PHONY: build-all
-build-all: build build-lambda ## Compile the binary for all targets
+build-all: build build-lambda build-docker ## Compile the binary for all targets
 	@echo "All binaries built."
 
 .PHONY: run
