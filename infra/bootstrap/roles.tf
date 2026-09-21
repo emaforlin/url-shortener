@@ -397,6 +397,7 @@ data "aws_iam_policy_document" "deploy" {
       "lambda:GetAlias",
       "lambda:UpdateAlias",
       "lambda:GetFunction",
+      "lambda:GetFunctionConfiguration",
     ]
     resources = [
       local.function_arn,
